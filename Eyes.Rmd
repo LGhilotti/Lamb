@@ -1,0 +1,129 @@
+---
+  title: "LAtent Mixture of Bayesian Cluetring (Lamb) - User Manual"
+author: "Noirrit Kiran Chandra"
+date: "8/19/2021"
+output:
+  github_document:
+  pandoc_args: --webtex
+---
+
+```{r Compile the source C++ file, echo=TRUE}
+library("Rcpp")
+library("pracma")
+library("tidyverse")
+library("ggpubr")
+library("uwot")
+library("irlba")
+library("mclust")
+library("mcclust")
+library("readxl")
+
+sourceCpp("DL_linear_split_merge_package.cpp") ##This is the souce C++ file
+```
+
+## Pipeline of Fitting the Lamb Model
+
+#### Pre-processing Data
+
+We center the data with respect to the *median* and scale ALL variables with the *median standard deviations* of the observed variables.
+
+```{r Pre-processing}
+y <- read_excel("eyes_data.xlsx")
+
+y_original=y
+y=y_original
+centering.var=median(colMeans(y))
+scaling.var=median(apply(y,2,sd))
+y=(y_original-centering.var)/scaling.var
+```
+
+#### Empirical Estimation the Latent Dimension `d` and Initializing `eta` & `lambda`
+
+Perform a sparse PCA on the pre-processed data.
+
+```{r Sparse PCA}
+pca.results=irlba::irlba(y, nv=40)
+```
+
+`d` is set to be the minimum number of eigenbalues explaining at least 95% of the variability in the data.
+
+```{r Estimation of d}
+cum_eigs= cumsum(pca.results$d)/sum(pca.results$d)
+d=min(which(cum_eigs>.95)) 
+d=ifelse(d<=15,15,d) # Set d= at least 15
+```
+
+Left and right singular values of `y` are used to initialize `eta` and `lambda` respectively for the MCMC.
+
+```{r Singular value initialization}
+eta= pca.results$u %*% diag(pca.results$d)
+eta=eta[,1:d] #Left singular values of y are used as to initialize eta
+lambda=pca.results$v[,1:d] #Right singular values of y are used to initialize lambda
+```
+
+#### Initializing Cluster Allocations using `KMenas`
+
+```{r KMeans Initialization}
+cluster.start = kmeans(y, 80)$cluster - 1
+```
+
+### Set Prior Parameter of `Lamb`
+
+##### Parameter Description in the Chandra et al. (2021+) Notations:
+
+| Parameters                                                                                                                                                                                                                                                        | Description                                                                                                                                                                                     |
+  |-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+  | `as`=![formula](https://render.githubusercontent.com/render/math?math=a_%5Csigma); `bs`=![formula](https://render.githubusercontent.com/render/math?math=b_%5Csigma)                                                                                              | The Gamma hyperparameters for residual precision ![formula](https://render.githubusercontent.com/render/math?math=%5Csigma_j%5E%7B-2%7D)'s for j=1,...,p                                        |
+| `a`=<img src="https://render.githubusercontent.com/render/math?math=a "/>                                                                                                                                                                                         | Dirichlet-Laplace parameter on `lambda`                                                                                                                                                         |
+| `diag_psi_iw`=![formula](https://render.githubusercontent.com/render/math?math=%5Cxi%5E2); `niw_kap`=![formula](https://render.githubusercontent.com/render/math?math=%5Ckappa_0); `nu`=![formula](https://render.githubusercontent.com/render/math?math=%5Cnu_0) | Hyperarameters for the Normal-Inverse Wishart base measure ![formula](https://render.githubusercontent.com/render/math?math=G_0) of the Dirichlet process prior on `eta`                        |
+| `a_dir`=![formula](https://render.githubusercontent.com/render/math?math=a_%5Calpha); `b_dir`=![formula](https://render.githubusercontent.com/render/math?math=b_%5Calpha)                                                                                        | Gamma hyperparameters for the conjugate Gamma(![formula](https://render.githubusercontent.com/render/math?math=a_%5Calpha,b_%5Calpha)) prior on the Dirichlet-process concentration parameter 𝛼 |
+
+##### Set Prior Hyperparameters
+
+```{r Set prior hyperparameters}
+as = 1; bs = 0.3 
+a=0.5
+diag_psi_iw=20
+niw_kap=1e-3
+nu=d+50
+a_dir=.1
+b_dir=.1
+```
+
+#### Fit the `Lamb` Model
+
+```{r Fit Lamb}
+result.lamb <- DL_mixture(a_dir, b_dir, diag_psi_iw=diag_psi_iw, niw_kap=niw_kap, niw_nu=nu, 
+                          as=as, bs=bs, a=a,
+                          nrun=5e3, burn=1e3, thin=5, 
+                          nstep = 5,prob=0.5, #With probability `prob` either the Split-Merge sampler with `nstep` Gibbs scans or Gibbs sampler in performed 
+                          lambda, eta, y,
+                          del = cluster.start, 
+                          dofactor=1 #If dofactor set to 0, clustering will be done on the initial input eta values only; eta will not be updated in MCMC
+                          )
+```
+
+### Posterior Summary of the MCMC Samples
+
+We compute summaries of the MCMC samples of cluster allocation variables following *Wade and Ghahramani (2018, Bayesian Analysis)*.
+
+```{r Posterior Summary}
+burn=2e2 #burn/thin
+post.samples=result.lamb[-(1:burn),]+1
+sim.mat.lamb <- mcclust::comp.psm(post.samples) # Compute posterior similarity matrix
+clust.lamb <-   minbinder(sim.mat.lamb)$cl # Minimizing Binder loss across MCMC estimates
+```
+
+### Adjusted Rand Index
+
+```{r adjustedRandIndex}
+adjustedRandIndex( clust.lamb, s)
+```
+
+### UMAP Plot of Lamb Clustering
+
+```{r, UMAP Plot of Lamb,   fig.height=4.5, fig.width=5, dpi=300}
+dat.lamb=data.frame(umap_data, Cluster=as.factor(clust.lamb)); colnames(dat.true)= c("UMAP1","UMAP2", "Cluster")
+p.lamb<-ggplot(data = dat.true, mapping = aes(x = UMAP1, y = UMAP2 ,colour=Cluster)) + geom_point()
+p.lamb
+```
